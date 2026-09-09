@@ -1,0 +1,6 @@
+{
+  "python.defaultInterpreterPath": "C:\\laragon\\bin\\python\\python-3.10\\python.exe",
+  "python.analysis.extraPaths": [
+    "C:/laragon/bin/python/python-3.10/lib/site-packages"
+  ]
+}

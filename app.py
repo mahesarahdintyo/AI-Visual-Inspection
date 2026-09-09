@@ -1,16 +1,11 @@
-import os
-os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
-
 import cv2
 import numpy as np
 import serial
 import time
-from tensorflow import keras
+import keras # type: ignore
 
-# --- 1. LOAD MODEL AI (FORMAT SAVEDMODEL Di KERAS 3) ---
+# --- 1. LOAD MODEL AI ---
 print("[INFO] Memuat Model AI...")
-# Menggunakan TFSMLayer untuk membaca folder model.savedmodel
 model_layer = keras.layers.TFSMLayer("model.savedmodel", call_endpoint="serving_default")
 class_names = [line.strip() for line in open("labels.txt", "r").readlines()]
 print("[INFO] Model AI Berhasil Dimuat!")
@@ -34,23 +29,34 @@ def send_command(cmd):
     if arduino and arduino.is_open:
         arduino.write(f"{cmd}\n".encode('utf-8'))
 
-# --- 3. KONFIGURASI KAMERA ---
-WINDOW_NAME = "AI Visual Inspection - Teachable Machine AI"
+# --- 3. KONFIGURASI KAMERA (FIXED FOR CAMO) ---
+WINDOW_NAME = "AI Visual Inspection - Camo Camera Fixed"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(WINDOW_NAME, 960, 540)
 
-cap = cv2.VideoCapture(1) # Ganti 1/2 jika menggunakan Camo iPhone
+# Gunakan indeks Camo (biasanya 1/2). Lepas backend CAP_DSHOW agar Camo tidak black screen!
+CAM_INDEX = 1  # Ubah ke 2 jika indeks 1 masih hitam
+cap = cv2.VideoCapture(CAM_INDEX)
 
 last_state = ""
 last_send_time = 0
 
+# OPTIMASI: AI dijalankan setiap 6 frame sekali agar FPS sangat mulus
+frame_count = 0
+AI_PREDICT_INTERVAL = 6  
+current_status = "INITIALIZING..."
+color_status = (255, 192, 0)
+
 while True:
     ret, frame = cap.read()
     if not ret:
-        break
+        print("[WARN] Gagal membaca frame dari Camo. Membaca ulang...")
+        time.sleep(0.1)
+        continue
 
     frame = cv2.flip(frame, 1)
     height, width, _ = frame.shape
+    frame_count += 1
 
     # Area Inspeksi (ROI)
     box_size = 300
@@ -59,41 +65,48 @@ while True:
     
     roi = frame[y1:y2, x1:x2]
 
-    # --- 4. PREPROCESSING UNTUK AI ---
-    image_resized = cv2.resize(roi, (224, 224), interpolation=cv2.INTER_AREA)
-    image_array = np.asarray(image_resized, dtype=np.float32).reshape(1, 224, 224, 3)
-    normalized_image_array = (image_array / 127.5) - 1.0
+    # --- A. PROSES CONTOUR OPENCV (Deteksi Garis Cacat) ---
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+    edges = cv2.Canny(blurred, 50, 150)
+    contours, _ = cv2.findContours(edges, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
 
-    # --- 5. PREDIKSI AI ---
-    # TFSMLayer mengembalikan dictionary output tensor
-    outputs = model_layer(normalized_image_array)
-    # Ambil tensor output pertama dari dictionary
-    prediction_tensor = list(outputs.values())[0]
-    prediction = prediction_tensor.numpy()
+    # --- B. INFERENSI AI (Ringan & Ringkas) ---
+    if frame_count % AI_PREDICT_INTERVAL == 0:
+        image_resized = cv2.resize(roi, (224, 224), interpolation=cv2.INTER_AREA)
+        image_array = np.asarray(image_resized, dtype=np.float32).reshape(1, 224, 224, 3)
+        normalized_image_array = (image_array / 127.5) - 1.0
 
-    index = np.argmax(prediction)
-    class_name = class_names[index]
-    confidence_score = prediction[0][index]
+        outputs = model_layer(normalized_image_array)
+        prediction_tensor = list(outputs.values())[0]
+        prediction = prediction_tensor.numpy()
 
-    label_detected = class_name.split(' ', 1)[-1].strip().upper()
+        index = np.argmax(prediction)
+        class_name = class_names[index]
+        confidence_score = prediction[0][index]
+        label_detected = class_name.split(' ', 1)[-1].strip().upper()
 
-    # Ambang keyakinan AI minimal 70% (0.70)
-    if label_detected == "OK" and confidence_score > 0.7:
-        current_status = f"PART OK ({confidence_score*100:.1f}%)"
-        color_status = (0, 255, 0) # Hijau
-        cmd_to_send = "OK"
-    else:
-        current_status = f"PART NG / DEFECT ({confidence_score*100:.1f}%)"
-        color_status = (0, 0, 255) # Merah
-        cmd_to_send = "NG"
+        if label_detected == "OK" and confidence_score > 0.7:
+            current_status = f"PART OK ({confidence_score*100:.1f}%)"
+            color_status = (0, 255, 0)
+            cmd_to_send = "OK"
+        else:
+            current_status = f"PART NG / DEFECT ({confidence_score*100:.1f}%)"
+            color_status = (0, 0, 255)
+            cmd_to_send = "NG"
 
-    # Kirim Sinyal Serial ke ESP32
-    if cmd_to_send != last_state or (time.time() - last_send_time > 1.0):
-        send_command(cmd_to_send)
-        last_state = cmd_to_send
-        last_send_time = time.time()
+        if cmd_to_send != last_state or (time.time() - last_send_time > 1.0):
+            send_command(cmd_to_send)
+            last_state = cmd_to_send
+            last_send_time = time.time()
 
-    # --- 6. OVERLAY DISPLAY MONITOR ---
+    # --- C. GAMBAR GARIS SENSOR KONTUR ---
+    for cnt in contours:
+        area = cv2.contourArea(cnt)
+        if 20 < area < 4000:
+            cv2.drawContours(roi, [cnt], -1, color_status, 2)
+
+    # --- D. OVERLAY MONITOR ---
     cv2.rectangle(frame, (x1, y1), (x2, y2), color_status, 3)
     
     overlay = frame.copy()
