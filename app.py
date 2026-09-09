@@ -1,86 +1,111 @@
+import os
+os.environ['TF_ENABLE_ONEDNN_OPTS'] = '0'
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
 import cv2
+import numpy as np
 import serial
 import time
+from tensorflow import keras
 
-# --- KONFIGURASI KONEKSI ESP32 ---
-IS_SIMULATION = True  # Ubah ke False jika nanti sudah memakai ESP32 Fisik (Kabel USB)
+# --- 1. LOAD MODEL AI (FORMAT SAVEDMODEL Di KERAS 3) ---
+print("[INFO] Memuat Model AI...")
+# Menggunakan TFSMLayer untuk membaca folder model.savedmodel
+model_layer = keras.layers.TFSMLayer("model.savedmodel", call_endpoint="serving_default")
+class_names = [line.strip() for line in open("labels.txt", "r").readlines()]
+print("[INFO] Model AI Berhasil Dimuat!")
+
+# --- 2. KONFIGURASI SERIAL ESP32 ---
+IS_SIMULATION = True
 
 try:
     if IS_SIMULATION:
-        # Koneksi ke Wokwi Simulator via RFC2217 Port 4000
         arduino = serial.serial_for_url('rfc2217://localhost:4000', baudrate=115200, timeout=1)
-        print("[CONNECTED] Terhubung ke Wokwi Simulator Port 4000")
+        print("[CONNECTED] Terhubung ke Wokwi Simulator")
     else:
-        # Koneksi ke ESP32 Fisik (Sesuaikan 'COM3' dengan port USB laptop kamu)
         arduino = serial.Serial('COM3', 115200, timeout=1)
         print("[CONNECTED] Terhubung ke ESP32 Fisik")
     time.sleep(2)
 except Exception as e:
-    print(f"[ERROR] Gagal terhubung ke ESP32/Wokwi: {e}")
+    print(f"[ERROR] Koneksi Serial Gagal: {e}")
     arduino = None
 
-# --- KONFIGURASI KAMERA & DISPLAY ---
-WINDOW_NAME = "AI Visual Inspection System - QC Monitor"
+def send_command(cmd):
+    if arduino and arduino.is_open:
+        arduino.write(f"{cmd}\n".encode('utf-8'))
+
+# --- 3. KONFIGURASI KAMERA ---
+WINDOW_NAME = "AI Visual Inspection - Teachable Machine AI"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(WINDOW_NAME, 960, 540)
 
-# Akses Kamera (0 = Webcam/Camo, ubah 1/2 jika menggunakan Camo iPhone)
-cap = cv2.VideoCapture(1)
+cap = cv2.VideoCapture(1) # Ganti 1/2 jika menggunakan Camo iPhone
 
-current_status = "READY"
-color_status = (255, 192, 0) # Cyan
-
-def send_command(cmd):
-    """Fungsi untuk mengirim data ke ESP32"""
-    if arduino and arduino.is_open:
-        data = f"{cmd}\n"
-        arduino.write(data.encode('utf-8'))
-        print(f"--> Sinyal Dikirim ke ESP32: {cmd}")
+last_state = ""
+last_send_time = 0
 
 while True:
     ret, frame = cap.read()
     if not ret:
-        print("Gagal mengakses kamera.")
         break
 
     frame = cv2.flip(frame, 1)
     height, width, _ = frame.shape
 
-    # --- AREA INSPEKSI PART ---
-    box_size = 250
-    x1 = int((width - box_size) / 2)
-    y1 = int((height - box_size) / 2)
+    # Area Inspeksi (ROI)
+    box_size = 300
+    x1, y1 = int((width - box_size) / 2), int((height - box_size) / 2)
     x2, y2 = x1 + box_size, y1 + box_size
+    
+    roi = frame[y1:y2, x1:x2]
 
+    # --- 4. PREPROCESSING UNTUK AI ---
+    image_resized = cv2.resize(roi, (224, 224), interpolation=cv2.INTER_AREA)
+    image_array = np.asarray(image_resized, dtype=np.float32).reshape(1, 224, 224, 3)
+    normalized_image_array = (image_array / 127.5) - 1.0
+
+    # --- 5. PREDIKSI AI ---
+    # TFSMLayer mengembalikan dictionary output tensor
+    outputs = model_layer(normalized_image_array)
+    # Ambil tensor output pertama dari dictionary
+    prediction_tensor = list(outputs.values())[0]
+    prediction = prediction_tensor.numpy()
+
+    index = np.argmax(prediction)
+    class_name = class_names[index]
+    confidence_score = prediction[0][index]
+
+    label_detected = class_name.split(' ', 1)[-1].strip().upper()
+
+    # Ambang keyakinan AI minimal 70% (0.70)
+    if label_detected == "OK" and confidence_score > 0.7:
+        current_status = f"PART OK ({confidence_score*100:.1f}%)"
+        color_status = (0, 255, 0) # Hijau
+        cmd_to_send = "OK"
+    else:
+        current_status = f"PART NG / DEFECT ({confidence_score*100:.1f}%)"
+        color_status = (0, 0, 255) # Merah
+        cmd_to_send = "NG"
+
+    # Kirim Sinyal Serial ke ESP32
+    if cmd_to_send != last_state or (time.time() - last_send_time > 1.0):
+        send_command(cmd_to_send)
+        last_state = cmd_to_send
+        last_send_time = time.time()
+
+    # --- 6. OVERLAY DISPLAY MONITOR ---
     cv2.rectangle(frame, (x1, y1), (x2, y2), color_status, 3)
-    cv2.putText(frame, "AREA INSPEKSI PART", (x1, y1 - 10),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color_status, 2)
-
-    # --- HEADER MONITOR ---
+    
     overlay = frame.copy()
-    cv2.rectangle(overlay, (0, 0), (width, 80), (30, 30, 30), -1)
+    cv2.rectangle(overlay, (0, 0), (width, 70), (30, 30, 30), -1)
     frame = cv2.addWeighted(overlay, 0.7, frame, 0.3, 0)
 
-    cv2.putText(frame, f"STATUS: {current_status}", (20, 50),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, color_status, 3)
-    cv2.putText(frame, "Simulasi Keyboard: [O] = OK | [N] = NG (Defect) | [Q] = Quit", 
-                (20, height - 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    cv2.putText(frame, f"STATUS: {current_status}", (20, 45),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.8, color_status, 2)
 
     cv2.imshow(WINDOW_NAME, frame)
 
-    key = cv2.waitKey(1) & 0xFF
-
-    if key in (ord('o'), ord('O')):
-        current_status = "PART OK"
-        color_status = (0, 255, 0) # Hijau
-        send_command("OK")
-
-    elif key in (ord('n'), ord('N')):
-        current_status = "PART NG (DEFECT)"
-        color_status = (0, 0, 255) # Merah
-        send_command("NG")
-
-    elif key in (ord('q'), ord('Q')):
+    if cv2.waitKey(1) & 0xFF == ord('q'):
         break
 
 if arduino and arduino.is_open:
