@@ -2,9 +2,31 @@ import cv2
 import numpy as np
 import time
 import serial
+import os
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # Kurangi log verbose TensorFlow
+import tensorflow as tf
 
 # ==========================================================
-# 1. KONFIGURASI SERIAL ESP32 / WOKWI
+# 1. LOAD MODEL AI (SAVEDMODEL VIA TENSORFLOW CORE)
+# ==========================================================
+print("[INFO] Memuat Model AI dari 'model.savedmodel'...")
+try:
+    ai_model = tf.saved_model.load("model.savedmodel")
+    ai_infer = ai_model.signatures["serving_default"]
+    
+    # Baca labels.txt
+    with open("labels.txt", "r") as f:
+        class_names = [line.strip().split(" ", 1)[-1].upper() for line in f if line.strip()]
+    print(f"[SUCCESS] Model AI Berhasil Dimuat! Classes: {class_names}")
+    IS_AI_ACTIVE = True
+except Exception as e:
+    print(f"[ERROR] Gagal memuat Model AI: {e}")
+    ai_infer = None
+    IS_AI_ACTIVE = False
+    class_names = ["OK", "NG"]
+
+# ==========================================================
+# 2. KONFIGURASI SERIAL ESP32 / WOKWI
 # ==========================================================
 IS_SIMULATION = True   # False jika menggunakan ESP32 Fisik
 SERIAL_PORT = 'COM3'    # Port COM untuk ESP32 Fisik
@@ -28,9 +50,9 @@ def send_command(cmd):
             print(f"[ERR] Gagal kirim serial: {e}")
 
 # ==========================================================
-# 2. KONFIGURASI KAMERA & TAMPILAN SISTEM (ENTERPRISE AOI)
+# 3. KONFIGURASI KAMERA & TAMPILAN SISTEM (ENTERPRISE AOI)
 # ==========================================================
-APP_TITLE = "AOI-Vision Pro // Industrial Quality Inspection System"
+APP_TITLE = "AOI-Vision Pro // Industrial Quality Inspection System (AI Master)"
 WINDOW_NAME = "AOI-Vision Pro - Automated Optical Inspection"
 cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 cv2.resizeWindow(WINDOW_NAME, 1080, 720)
@@ -43,7 +65,7 @@ if not cap.isOpened():
     cam_index = 0
     cap = cv2.VideoCapture(cam_index)
 
-# Variabel Animasi Scanning & Kontrol
+# Variabel Animasi Scanning & Kontrol AI
 scan_y_offset = 0
 scan_direction = 1
 scan_speed = 6
@@ -51,13 +73,19 @@ last_state = ""
 last_send_time = 0
 fps_time = time.time()
 fps = 30.0
+frame_count = 0
+
+# Interval inferensi AI (dipanggil setiap 3 frame agar sangat responsif)
+AI_INTERVAL = 3
+latest_ai_label = "OK"
+latest_ai_conf = 0.99
 
 # Debouncing buffer kestabilan status (mencegah flickering)
 state_history = []
-HISTORY_LEN = 4
+HISTORY_LEN = 3
 
 # ==========================================================
-# 3. ELEMEN GRAFIS HUD KELAS INDUSTRI
+# 4. ELEMEN GRAFIS HUD KELAS INDUSTRI
 # ==========================================================
 def draw_precision_brackets(img, x, y, w, h, color, length=28, thickness=2):
     """Menggambar bracket sudut presisi industri"""
@@ -74,7 +102,7 @@ def draw_precision_brackets(img, x, y, w, h, color, length=28, thickness=2):
     cv2.line(img, (x + w, y + h), (x + w - length, y + h), color, thickness)
     cv2.line(img, (x + w, y + h), (x + w, y + h - length), color, thickness)
 
-def draw_hud_header(img, w, is_locked, fps_val, cam_id):
+def draw_hud_header(img, w, is_locked, fps_val, cam_id, ai_active):
     """Dashboard status bar profesional di bagian atas"""
     overlay = img.copy()
     cv2.rectangle(overlay, (0, 0), (w, 52), (18, 22, 28), -1)
@@ -88,16 +116,22 @@ def draw_hud_header(img, w, is_locked, fps_val, cam_id):
     # Status Lock Target
     status_text = "TARGET: ACQUIRED" if is_locked else "TARGET: SCANNING"
     status_color = (0, 255, 120) if is_locked else (0, 190, 255)
-    cv2.putText(img, status_text, (w - 410, 33),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.52, status_color, 1)
+    cv2.putText(img, status_text, (w - 490, 33),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, status_color, 1)
+
+    # Status AI Core
+    ai_status_str = "AI: ONLINE" if ai_active else "AI: OFFLINE"
+    ai_status_color = (0, 255, 120) if ai_active else (0, 160, 255)
+    cv2.putText(img, ai_status_str, (w - 320, 33),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.50, ai_status_color, 1)
 
     # Telemetri FPS & Port Kamera
     fps_text = f"FPS: {fps_val:.1f} | CAM: [{cam_id}]"
-    cv2.putText(img, fps_text, (w - 190, 33),
+    cv2.putText(img, fps_text, (w - 185, 33),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.48, (190, 190, 190), 1)
 
 # ==========================================================
-# 4. MAIN LOOP INSPEKSI
+# 5. MAIN LOOP INSPEKSI
 # ==========================================================
 print(f"[INFO] {APP_TITLE} Aktif!")
 print("[INFO] Tekan 'q' untuk keluar | Tekan 'c' untuk beralih kamera (0 / 1)")
@@ -115,6 +149,7 @@ while True:
     if dt > 0:
         fps = (fps * 0.9) + ((1.0 / dt) * 0.1)
 
+    frame_count += 1
     frame = cv2.flip(frame, 1)
     display_frame = frame.copy()
     h, w, _ = frame.shape
@@ -122,23 +157,21 @@ while True:
     # ------------------------------------------------------
     # A. SEGMENTASI PRESISI: ISOLASI KERTAS PUTIH vs MEJA KAYU
     # ------------------------------------------------------
-    # Kertas putih: Saturation SANGAT RENDAH (mendekati 0) & Value TINGGI
-    # Meja kayu/refleksi: Saturation TINGGI (> 55) & Value lebih gelap
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
-    # 1. Filter HSV ketat: Batasi saturation maksimal 38 agar meja kayu tereliminasi 100%
-    lower_white = np.array([0, 0, 140])
+    # Filter HSV: Batasi saturation maksimal 38 agar meja kayu tereliminasi 100%
+    lower_white = np.array([0, 0, 135])
     upper_white = np.array([180, 38, 255])
     mask_hsv = cv2.inRange(hsv, lower_white, upper_white)
 
-    # 2. Filter Kecerahan Grayscale
-    _, mask_gray = cv2.threshold(gray, 145, 255, cv2.THRESH_BINARY)
+    # Filter Kecerahan Grayscale
+    _, mask_gray = cv2.threshold(gray, 140, 255, cv2.THRESH_BINARY)
 
     # Kombinasikan kedua filter (Intersection)
     thresh = cv2.bitwise_and(mask_hsv, mask_gray)
 
-    # Bersihkan noise dengan kernel kecil agar tidak menyambung ke refleksi meja
+    # Bersihkan noise dengan kernel kecil agar rapi
     kernel_small = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel_small, iterations=1)
     thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel_small, iterations=1)
@@ -153,41 +186,49 @@ while True:
     if is_target_found:
         # Ambil kontur benda kerja terbesar (kertas putih yang diinspeksi)
         main_obj = max(valid_contours, key=cv2.contourArea)
-        x, y, bw, bh = cv2.boundingRect(main_obj)
+        
+        # Gunakan convex hull agar bounding box rapi, kokoh, dan tidak terganggu bayangan tepi
+        hull = cv2.convexHull(main_obj)
+        x, y, bw, bh = cv2.boundingRect(hull)
 
         # --------------------------------------------------
-        # B. DETEKSI CACAT / SOBEKAN / DEFECT (INTERNAL ROI)
+        # B. INFERENSI DEEP LEARNING AI (model.savedmodel)
         # --------------------------------------------------
-        # Margin 12px ke dalam agar perbatasan tepi luar kertas tidak dianggap cacat
-        margin = 12
-        defects = []
+        roi_target = frame[y:y+bh, x:x+bw]
 
-        if bw > (2 * margin + 15) and bh > (2 * margin + 15):
-            roi_inner = frame[y + margin : y + bh - margin, x + margin : x + bw - margin]
-            roi_gray = cv2.cvtColor(roi_inner, cv2.COLOR_BGR2GRAY)
-            roi_blur = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+        if IS_AI_ACTIVE and ai_infer and (frame_count % AI_INTERVAL == 0) and bw > 30 and bh > 30:
+            try:
+                # Preprocessing standar 224x224 RGB dan normalisasi [-1, 1]
+                roi_resized = cv2.resize(roi_target, (224, 224), interpolation=cv2.INTER_AREA)
+                roi_rgb = cv2.cvtColor(roi_resized, cv2.COLOR_BGR2RGB)
+                input_arr = (np.expand_dims(roi_rgb, axis=0).astype(np.float32) / 127.5) - 1.0
+                
+                # Panggil model TensorFlow
+                predictions = ai_infer(tf.constant(input_arr))
+                pred_values = list(predictions.values())[0].numpy()[0]
+                
+                idx_pred = int(np.argmax(pred_values))
+                latest_ai_conf = float(pred_values[idx_pred])
+                latest_ai_label = class_names[idx_pred] if idx_pred < len(class_names) else "OK"
+            except Exception as ex:
+                print(f"[WARN] Error inferensi AI: {ex}")
 
-            # Canny edge detector khusus mendeteksi robekan atau goresan di dalam benda kerja
-            edges = cv2.Canny(roi_blur, 50, 140)
-            defect_contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        # --------------------------------------------------
+        # C. KEPUTUSAN UTAMA BERDASARKAN MODEL AI (MASTER JUDGE)
+        # --------------------------------------------------
+        # Model AI adalah penentu mutlak apakah produk OK atau NG
+        if latest_ai_label == "NG" and latest_ai_conf >= 0.60:
+            raw_status = "NG"
+            is_defect = True
+        else:
+            raw_status = "OK"
+            is_defect = False
 
-            for dc in defect_contours:
-                arc_len = cv2.arcLength(dc, False)
-                _, _, dw, dh = cv2.boundingRect(dc)
-                diag = np.sqrt(dw**2 + dh**2)
-
-                # Syarat cacat: panjang garis > 35px atau ukuran diagonal > 22px
-                # dan tidak melebihi ukuran kertas (menghindari false trigger)
-                if (arc_len > 35 or diag > 22) and (dw < bw * 0.85 and dh < bh * 0.85):
-                    defects.append((dc, margin))
-
-        # Stabilkan status inspeksi (debouncing history buffer)
-        raw_status = "NG" if len(defects) > 0 else "OK"
         state_history.append(raw_status)
         if len(state_history) > HISTORY_LEN:
             state_history.pop(0)
 
-        # Status keputusan final berdasarkan frame terbaru
+        # Status final berdasarkan mayoritas frame terakhir
         is_defect = state_history.count("NG") >= (HISTORY_LEN // 2 + 1)
         current_cmd = "NG" if is_defect else "OK"
 
@@ -198,7 +239,31 @@ while True:
             last_send_time = time.time()
 
         # --------------------------------------------------
-        # C. ANIMASI SCANNING LASER (Optical Sweeper)
+        # D. LOKALISASI CACAT HANYA SAAT AI MENYATAKAN NG
+        # --------------------------------------------------
+        # Jika AI menyatakan ada cacat (NG), kita cari titik lokasi robekan untuk diberi target reticle
+        defects = []
+        if is_defect:
+            margin = 18  # Margin aman agar bayangan tepi luar kertas tidak ikut terdeteksi
+            if bw > (2 * margin + 20) and bh > (2 * margin + 20):
+                roi_inner = frame[y + margin : y + bh - margin, x + margin : x + bw - margin]
+                roi_gray = cv2.cvtColor(roi_inner, cv2.COLOR_BGR2GRAY)
+                roi_blur = cv2.GaussianBlur(roi_gray, (5, 5), 0)
+
+                edges = cv2.Canny(roi_blur, 60, 150)
+                defect_contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+                for dc in defect_contours:
+                    arc_len = cv2.arcLength(dc, False)
+                    _, _, dw, dh = cv2.boundingRect(dc)
+                    diag = np.sqrt(dw**2 + dh**2)
+
+                    # Garis robekan nyata di dalam kertas
+                    if (arc_len > 40 or diag > 25) and (dw < bw * 0.8 and dh < bh * 0.8):
+                        defects.append((dc, margin))
+
+        # --------------------------------------------------
+        # E. ANIMASI SCANNING LASER (Optical Sweeper)
         # --------------------------------------------------
         scan_y_offset += scan_speed * scan_direction
         if scan_y_offset >= bh:
@@ -224,7 +289,7 @@ while True:
         cv2.line(display_frame, (x, scan_line_y), (x + bw, scan_line_y), (255, 255, 255), 2)
 
         # --------------------------------------------------
-        # D. HUD BRACKET PRESISI & BADGE STATUS
+        # F. HUD BRACKET PRESISI & BADGE STATUS
         # --------------------------------------------------
         hud_color = (0, 30, 255) if is_defect else (0, 255, 90)
         draw_precision_brackets(display_frame, x, y, bw, bh, hud_color, length=32, thickness=3)
@@ -232,25 +297,24 @@ while True:
         # Garis batas tipis mengikuti dimensi pas kertas
         cv2.rectangle(display_frame, (x, y), (x + bw, y + bh), hud_color, 1)
 
-        # Telemetri dimensi fisik objek di bawah kotak
-        telemetry_str = f"DIM: {bw}x{bh}px | LOC: [{x},{y}]"
+        # Telemetri dimensi fisik & skor AI di bawah kotak
+        conf_percent = latest_ai_conf * 100
+        telemetry_str = f"DIM: {bw}x{bh}px | AI: {latest_ai_label} ({conf_percent:.1f}%)"
         cv2.putText(display_frame, telemetry_str, (x, y + bh + 18),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.42, (200, 200, 200), 1)
 
         # Lebar badge dinamis menyesuaikan lebar objek
-        badge_w = max(280, min(bw, 360))
+        badge_w = max(290, min(bw, 380))
 
         if is_defect:
-            # STATUS NG / REJECT
-            badge_text = f"[ DEFECT DETECTED | REJECT ({len(defects)}) ]"
+            # STATUS NG / REJECT (HANYA MUNCUL JIKA AI MEMVONIS NG)
+            badge_text = f"[ DEFECT DETECTED | REJECT (AI: {conf_percent:.1f}%) ]"
             cv2.rectangle(display_frame, (x, y - 36), (x + badge_w, y - 8), (0, 0, 180), -1)
             cv2.putText(display_frame, badge_text, (x + 8, y - 16),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.58, (255, 255, 255), 1)
+                        cv2.FONT_HERSHEY_DUPLEX, 0.52, (255, 255, 255), 1)
             cv2.line(display_frame, (x, y - 8), (x + badge_w, y - 8), (0, 30, 255), 2)
 
-            # ----------------------------------------------
-            # E. TARGET RETICLE TEPAT DI TITIK CACAT
-            # ----------------------------------------------
+            # Target Reticle pada titik robekan (jika ditemukan)
             for idx, (dc, offset_m) in enumerate(defects[:4]):
                 dx, dy, dw, dh = cv2.boundingRect(dc)
                 center_x = x + offset_m + dx + dw // 2
@@ -277,16 +341,16 @@ while True:
                             cv2.FONT_HERSHEY_SIMPLEX, 0.42, (0, 255, 255), 1)
 
         else:
-            # STATUS OK / PASS
-            badge_text = "[ QUALITY OK | SPEC APPROVED ]"
+            # STATUS OK / PASS (SESUAI PREDIKSI MODEL AI)
+            badge_text = f"[ QUALITY OK | AI CONF: {conf_percent:.1f}% ]"
             cv2.rectangle(display_frame, (x, y - 36), (x + badge_w, y - 8), (0, 135, 45), -1)
             cv2.putText(display_frame, badge_text, (x + 8, y - 16),
-                        cv2.FONT_HERSHEY_DUPLEX, 0.58, (255, 255, 255), 1)
+                        cv2.FONT_HERSHEY_DUPLEX, 0.55, (255, 255, 255), 1)
             cv2.line(display_frame, (x, y - 8), (x + badge_w, y - 8), (0, 255, 100), 2)
 
     else:
         # --------------------------------------------------
-        # F. TAMPILAN STANDBY / SEARCHING WORKPIECE
+        # G. TAMPILAN STANDBY / SEARCHING WORKPIECE
         # --------------------------------------------------
         state_history.clear()
         
@@ -304,7 +368,7 @@ while True:
                     cv2.FONT_HERSHEY_DUPLEX, 0.60, (240, 240, 240), 1)
 
     # Header Dashboard
-    draw_hud_header(display_frame, w, is_target_found, fps, cam_index)
+    draw_hud_header(display_frame, w, is_target_found, fps, cam_index, IS_AI_ACTIVE)
 
     # Tampilkan jendela inspeksi
     cv2.imshow(WINDOW_NAME, display_frame)
